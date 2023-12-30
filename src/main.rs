@@ -294,10 +294,12 @@ async fn get_artifacts_for_revision(client: &Client, options: &Options, revision
                          // completion of a download.
 
     let task_counts = Arc::new(Mutex::new(BTreeMap::new()));
+    let run_counts = Arc::new(Mutex::new(BTreeMap::new()));
     let artifacts = artifacts.then(|(job, artifact_name)| {
         let client = &client;
         let out_dir = &out_dir;
         let task_counts = &task_counts;
+        let run_counts = &run_counts;
         let taskcluster_host = &taskcluster_host;
         let progress_bar = progress_bar.clone();
         async move {
@@ -322,6 +324,14 @@ async fn get_artifacts_for_revision(client: &Client, options: &Options, revision
                 let task_count = task_counts.entry(job_path.clone()).or_insert(0);
                 this_task_idx = *task_count;
                 *task_count += 1;
+            }
+
+            let this_run_idx: u32;
+            {
+                let mut run_counts = run_counts.lock().unwrap();
+                let run_count = run_counts.entry(task_id.clone()).or_insert(0);
+                this_run_idx = *run_count;
+                *run_count += 1;
             }
 
             let job_display = lazy_format!(
@@ -371,24 +381,31 @@ async fn get_artifacts_for_revision(client: &Client, options: &Options, revision
                 return;
             }
 
-            let artifact =
-                match get_artifact(client, taskcluster_host, task_id, artifact_name).await {
-                    Ok(bytes) => bytes,
-                    Err(code) => {
-                        progress_bar.suspend(|| {
-                            log::error!(
-                                concat!(
-                                    "got unexpected response {} with request for {}, ",
-                                    "artifact {:?}; skipping download"
-                                ),
-                                code,
-                                job_display,
-                                artifact_name
-                            );
-                        });
-                        return;
-                    }
-                };
+            let artifact = match get_artifact(
+                client,
+                taskcluster_host,
+                task_id,
+                artifact_name,
+                this_run_idx,
+            )
+            .await
+            {
+                Ok(bytes) => bytes,
+                Err(code) => {
+                    progress_bar.suspend(|| {
+                        log::error!(
+                            concat!(
+                                "got unexpected response {} with request for {}, ",
+                                "artifact {:?}; skipping download"
+                            ),
+                            code,
+                            job_display,
+                            artifact_name
+                        );
+                    });
+                    return;
+                }
+            };
 
             {
                 let parent_dir = local_artifact_path.parent().unwrap();
@@ -416,9 +433,11 @@ async fn get_artifact(
     taskcluster_host: &Url,
     task_id: &String,
     artifact_name: &str,
+    run_idx: u32,
 ) -> Result<Bytes, StatusCode> {
-    let url =
-        format!("{taskcluster_host}api/queue/v1/task/{task_id}/runs/0/artifacts/{artifact_name}");
+    let url = format!(
+        "{taskcluster_host}api/queue/v1/task/{task_id}/runs/{run_idx}/artifacts/{artifact_name}"
+    );
 
     let request = client.get(url);
     log::debug!("sending request {request:?}");
